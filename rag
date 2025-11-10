@@ -1,0 +1,358 @@
+"""
+rag_universal_pipeline.py
+-------------------------
+✅ Unified RAG (Retrieval-Augmented Generation) pipeline.
+✅ Handles multiple data types: TXT, PDF, DOCX, CSV, JSON.
+✅ Automatically extracts text, chunks it, converts to embeddings, and stores in ChromaDB.
+✅ Later used to retrieve context and answer questions using OpenAI GPT model.
+
+How to run:
+1️⃣  Prepare a 'data/' folder with mixed file types.
+2️⃣  Run: python rag_universal_pipeline.py build
+3️⃣  Then ask: python rag_universal_pipeline.py query "Your question here"
+"""
+
+import os
+import sys
+import json
+import pandas as pd
+from docx import Document
+from PyPDF2 import PdfReader
+
+# LangChain imports
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+from langchain.schema import Document as LCDocument
+
+# ==============================
+# CONFIGURATION
+# ==============================
+DATA_DIR = "data"            # folder containing your data files
+VECTOR_STORE_DIR = "chroma_store"  # where embeddings are persisted
+
+# ==============================
+# FILE LOADING HELPERS
+# ==============================
+
+def load_txt(file_path):
+    """Load plain text files."""
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        text = f.read()
+    return [LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_pdf(file_path):
+    """Load PDF files using PyPDF2."""
+    reader = PdfReader(file_path)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    return [LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_docx(file_path):
+    """Load DOCX (Word) files."""
+    doc = Document(file_path)
+    text = "\n".join([p.text for p in doc.paragraphs])
+    return [LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_csv(file_path):
+    """Load CSV files — convert rows into readable text blocks."""
+    df = pd.read_csv(file_path)
+    # Convert each row to a readable paragraph
+    docs = []
+    for i, row in df.iterrows():
+        text = " | ".join([f"{col}: {val}" for col, val in row.items()])
+        docs.append(LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)}))
+    return docs
+
+
+def load_json(file_path):
+    """Load JSON files — flatten them recursively."""
+    def flatten_json(y):
+        out = {}
+        def flatten(x, name=''):
+            if type(x) is dict:
+                for a in x:
+                    flatten(x[a], f'{name}{a}_')
+            elif type(x) is list:
+                i = 0
+                for a in x:
+                    flatten(a, f'{name}{i}_')
+                    i += 1
+            else:
+                out[name[:-1]] = x
+        flatten(y)
+        return out
+
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    docs = []
+    if isinstance(data, list):
+        for record in data:
+            flat = flatten_json(record)
+            text = " | ".join([f"{k}: {v}" for k, v in flat.items()])
+            docs.append(LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)}))
+    else:
+        flat = flatten_json(data)
+        text = " | ".join([f"{k}: {v}" for k, v in flat.items()])
+        docs.append(LCDocument(page_content=text, metadata={"source": os.path.basename(file_path)}))
+
+    return docs
+
+
+# ==============================
+# MAIN DOCUMENT LOADER
+# ==============================
+def load_all_documents(folder=DATA_DIR):
+    """Load all supported file types from the folder."""
+    all_docs = []
+    supported_ext = [".txt", ".pdf", ".docx", ".csv", ".json"]
+
+    for file in os.listdir(folder):
+        file_path = os.path.join(folder, file)
+        ext = os.path.splitext(file)[1].lower()
+
+        try:
+            if ext == ".txt":
+                all_docs.extend(load_txt(file_path))
+            elif ext == ".pdf":
+                all_docs.extend(load_pdf(file_path))
+            elif ext == ".docx":
+                all_docs.extend(load_docx(file_path))
+            elif ext == ".csv":
+                all_docs.extend(load_csv(file_path))
+            elif ext == ".json":
+                all_docs.extend(load_json(file_path))
+            else:
+                print(f"⚠️ Unsupported file type: {file}")
+        except Exception as e:
+            print(f"❌ Error loading {file}: {e}")
+
+    print(f"✅ Loaded {len(all_docs)} documents from {folder}")
+    return all_docs
+
+
+# ==============================
+# VECTOR STORE CREATION
+# ==============================
+def create_vector_store(docs, persist_dir=VECTOR_STORE_DIR):
+    """Split docs, create embeddings, and store in ChromaDB."""
+    print("🧩 Splitting documents into chunks...")
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_documents(docs)
+    print(f"📄 Created {len(chunks)} chunks")
+
+    print("🔢 Generating embeddings and saving to ChromaDB...")
+    embeddings = OpenAIEmbeddings()
+    vectordb = Chroma.from_documents(chunks, embeddings, persist_directory=persist_dir)
+    vectordb.persist()
+    print(f"💾 Vector store saved to {persist_dir}")
+
+
+# ==============================
+# RAG PIPELINE CREATION
+# ==============================
+def create_rag_pipeline(persist_dir=VECTOR_STORE_DIR):
+    """Create a RetrievalQA chain from stored embeddings."""
+    print("🔍 Loading Chroma vector database...")
+    embeddings = OpenAIEmbeddings()
+    vectordb = Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+
+    retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+    llm = ChatOpenAI(model_name="gpt-4-turbo", temperature=0.2)
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        return_source_documents=True
+    )
+    print("🤖 RAG pipeline ready for queries!")
+    return qa_chain
+
+
+# ==============================
+# QUERY EXECUTION
+# ==============================
+def query_rag(question, persist_dir=VECTOR_STORE_DIR):
+    """Query the vector database using an LLM."""
+    qa_chain = create_rag_pipeline(persist_dir)
+    response = qa_chain(question)
+
+    print("\n=====================")
+    print("💬 QUESTION:", question)
+    print("=====================")
+    print("🧠 ANSWER:", response["result"])
+    print("=====================")
+    print("📚 SOURCES:")
+    for src in response["source_documents"]:
+        print("  -", src.metadata.get("source", "unknown"))
+
+
+# ==============================
+# ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python rag_universal_pipeline.py build   # to build vector store")
+        print("  python rag_universal_pipeline.py query 'your question here'")
+        sys.exit(0)
+
+    command = sys.argv[1].lower()
+
+    if command == "build":
+        docs = load_all_documents(DATA_DIR)
+        create_vector_store(docs)
+    elif command == "query":
+        if len(sys.argv) < 3:
+            print("❌ Please provide a question to ask!")
+            sys.exit(0)
+        question = sys.argv[2]
+        query_rag(question)
+    else:
+        print("❌ Invalid command. Use 'build' or 'query'")
+
+
+
+# ==============================
+# 🧩 Example Usage
+# 1️⃣ Build the vector database (first time)
+# python rag_universal_pipeline.py build
+
+# Ask Questions
+# python rag_universal_pipeline.py query "What were the main results from the sales data?"
+
+
+
+# langchain
+# langchain-openai
+# chromadb
+# openai
+# tiktoken
+# pandas
+# PyPDF2
+# python-docx
+
+
+
+
+
+# To server on fastapi
+# langchain
+# langchain-openai
+# chromadb
+# fastapi
+# uvicorn
+# openai
+# tiktoken
+# pandas
+# PyPDF2
+
+
+"""
+rag_pipeline.py
+---------------
+Core Retrieval-Augmented Generation pipeline.
+1. Loads text/CSV/PDF documents.
+2. Converts them into embeddings using OpenAI.
+3. Stores them in a ChromaDB vector database.
+4. On query, retrieves most relevant chunks and generates answers.
+"""
+
+import os
+import pandas as pd
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader, PyPDFLoader, CSVLoader
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+
+# ========= STEP 1: LOAD DOCUMENTS ========= #
+def load_documents(data_folder="data"):
+    docs = []
+    for file in os.listdir(data_folder):
+        path = os.path.join(data_folder, file)
+        if file.endswith(".txt"):
+            docs.extend(TextLoader(path).load())
+        elif file.endswith(".pdf"):
+            docs.extend(PyPDFLoader(path).load())
+        elif file.endswith(".csv"):
+            docs.extend(CSVLoader(path).load())
+    print(f"✅ Loaded {len(docs)} documents from {data_folder}")
+    return docs
+
+# ========= STEP 2: CREATE VECTOR STORE ========= #
+def create_vector_store(docs, persist_dir="chroma_store"):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    split_docs = text_splitter.split_documents(docs)
+    print(f"📄 Split into {len(split_docs)} chunks")
+
+    embeddings = OpenAIEmbeddings()
+    vectordb = Chroma.from_documents(split_docs, embeddings, persist_directory=persist_dir)
+    vectordb.persist()
+    print(f"💾 Vector store saved to {persist_dir}")
+    return vectordb
+
+# ========= STEP 3: BUILD RETRIEVAL-QA PIPELINE ========= #
+def create_rag_pipeline(persist_dir="chroma_store"):
+    embeddings = OpenAIEmbeddings()
+    vectordb = Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+    retriever = vectordb.as_retriever(search_kwargs={"k": 4})
+    llm = ChatOpenAI(model_name="gpt-4-turbo", temperature=0.2)
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm, retriever=retriever, return_source_documents=True
+    )
+    print("🤖 RAG pipeline ready!")
+    return qa_chain
+
+# ========= STEP 4: MAIN (INITIAL SETUP) ========= #
+if __name__ == "__main__":
+    docs = load_documents("data")
+    create_vector_store(docs)
+
+
+
+"""
+app.py
+------
+FastAPI app to serve RAG chatbot.
+"""
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from rag_pipeline import create_rag_pipeline
+
+app = FastAPI(
+    title="RAG Chatbot API",
+    description="Chat with your data using Retrieval-Augmented Generation",
+    version="1.0"
+)
+
+# Load pipeline at startup
+qa_chain = create_rag_pipeline()
+
+class QueryRequest(BaseModel):
+    question: str
+
+@app.post("/chat")
+async def chat_with_data(request: QueryRequest):
+    try:
+        response = qa_chain(request.question)
+        answer = response["result"]
+        sources = [doc.metadata.get("source", "unknown") for doc in response["source_documents"]]
+        return {"answer": answer, "sources": sources}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# Step 4.1: Build Vector DB (only first time)
+# python rag_pipeline.py
+
+# Step 4.2: Start Chatbot API
+# uvicorn app:app --reload

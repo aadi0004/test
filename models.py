@@ -195,3 +195,23 @@ print("Prediction:", pred)
 """
 
 print("\n🎯 DONE! All models trained and best one saved successfully.")
+
+
+
+# Load model in your API or backend
+import joblib
+import pandas as pd
+
+# Load trained model
+model = joblib.load("best_model.joblib")
+
+# Create new sample
+sample = pd.DataFrame({
+    'age': [30],
+    'salary': [60000],
+    'gender': ['Male']
+})
+
+# Predict
+prediction = model.predict(sample)
+print("Predicted class:", prediction)
